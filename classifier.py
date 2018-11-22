@@ -15,21 +15,26 @@
 
 import os
 import json
-import cPickle
-from itertools import izip
+import threading
 
 import fire
 import h5py
+import tqdm
 import numpy as np
+import six
 
 from keras.models import load_model
 from keras.callbacks import ModelCheckpoint
+from six.moves import zip, cPickle
 
 from misc import get_logger, Option
 from network import TextOnly, top1_acc
 
 opt = Option('./config.json')
-cate1 = json.loads(open('../cate1.json').read())
+if six.PY2:
+    cate1 = json.loads(open('../cate1.json').read())
+else:
+    cate1 = json.loads(open('../cate1.json', 'rb').read().decode('utf-8'))
 DEV_DATA_LIST = ['../dev.chunk.01']
 
 
@@ -38,7 +43,7 @@ class Classifier():
         self.logger = get_logger('Classifier')
         self.num_classes = 0
 
-    def get_sample_generator(self, ds, batch_size):
+    def get_sample_generator(self, ds, batch_size, raise_stop_event=False):
         left, limit = 0, ds['uni'].shape[0]
         while True:
             right = min(left + batch_size, limit)
@@ -48,11 +53,13 @@ class Classifier():
             left = right
             if right == limit:
                 left = 0
+                if raise_stop_event:
+                    raise StopIteration
 
     def get_inverted_cate1(self, cate1):
         inv_cate1 = {}
         for d in ['b', 'm', 's', 'd']:
-            inv_cate1[d] = {v: k for k, v in cate1[d].iteritems()}
+            inv_cate1[d] = {v: k for k, v in six.iteritems(cate1[d])}
         return inv_cate1
 
     def write_prediction_result(self, data, pred_y, meta, out_path, readable):
@@ -61,14 +68,15 @@ class Classifier():
             h = h5py.File(data_path, 'r')['dev']
             pid_order.extend(h['pid'][::])
 
-        y2l = {i: s for s, i in meta['y_vocab'].iteritems()}
-        y2l = map(lambda x: x[1], sorted(y2l.items(), key=lambda x: x[0]))
+        y2l = {i: s for s, i in six.iteritems(meta['y_vocab'])}
+        y2l = list(map(lambda x: x[1], sorted(y2l.items(), key=lambda x: x[0])))
         inv_cate1 = self.get_inverted_cate1(cate1)
         rets = {}
-        for pid, p in izip(data['pid'], pred_y):
-            y = np.argmax(p)
+        for pid, y in zip(data['pid'], pred_y):
+            if six.PY3:
+                pid = pid.decode('utf-8')
             label = y2l[y]
-            tkns = map(int, label.split('>'))
+            tkns = list(map(int, label.split('>')))
             b, m, s, d = tkns
             assert b in inv_cate1['b']
             assert m in inv_cate1['m']
@@ -84,12 +92,15 @@ class Classifier():
         no_answer = '{pid}\t-1\t-1\t-1\t-1'
         with open(out_path, 'w') as fout:
             for pid in pid_order:
+                if six.PY3:
+                    pid = pid.decode('utf-8')
                 ans = rets.get(pid, no_answer.format(pid=pid))
-                print >> fout, ans
+                fout.write(ans)
+                fout.write('\n')
 
     def predict(self, data_root, model_root, test_root, test_div, out_path, readable=False):
         meta_path = os.path.join(data_root, 'meta')
-        meta = cPickle.loads(open(meta_path).read())
+        meta = cPickle.loads(open(meta_path, 'rb').read())
 
         model_fname = os.path.join(model_root, 'model.h5')
         self.logger.info('# of classes(train): %s' % len(meta['y_vocab']))
@@ -100,20 +111,24 @@ class Classifier():
         test_data = h5py.File(test_path, 'r')
 
         test = test_data[test_div]
-        test_gen = self.get_sample_generator(test, opt.batch_size)
+        batch_size = opt.batch_size
+        pred_y = []
+        test_gen = ThreadsafeIter(self.get_sample_generator(test, batch_size, raise_stop_event=True))
         total_test_samples = test['uni'].shape[0]
-        steps = int(np.ceil(total_test_samples / float(opt.batch_size)))
-        pred_y = model.predict_generator(test_gen,
-                                         steps=steps,
-                                         workers=opt.num_predict_workers,
-                                         verbose=1)
+        with tqdm.tqdm(total=total_test_samples) as pbar:
+            for chunk in test_gen:
+                total_test_samples = test['uni'].shape[0]
+                X, _ = chunk
+                _pred_y = model.predict(X)
+                pred_y.extend([np.argmax(y) for y in _pred_y])
+                pbar.update(X[0].shape[0])
         self.write_prediction_result(test, pred_y, meta, out_path, readable=readable)
 
     def train(self, data_root, out_dir):
         data_path = os.path.join(data_root, 'data.h5py')
         meta_path = os.path.join(data_root, 'meta')
         data = h5py.File(data_path, 'r')
-        meta = cPickle.loads(open(meta_path).read())
+        meta = cPickle.loads(open(meta_path, 'rb').read())
         self.weight_fname = os.path.join(out_dir, 'weights')
         self.model_fname = os.path.join(out_dir, 'model')
         if not os.path.isdir(out_dir):
@@ -155,6 +170,23 @@ class Classifier():
         model.load_weights(self.weight_fname) # loads from checkout point if exists
         open(self.model_fname + '.json', 'w').write(model.to_json())
         model.save(self.model_fname + '.h5')
+
+
+class ThreadsafeIter(object):
+    def __init__(self, it):
+        self._it = it
+        self._lock = threading.Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._lock:
+            return next(self._it)
+
+    def next(self):
+        with self._lock:
+            return self._it.next()
 
 
 if __name__ == '__main__':
